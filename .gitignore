@@ -1,6 +1,6 @@
 __pycache__/
 *.py[cod]
 .venv/
-results/
-*.npz
 *.npy
+**/prediction_metadata.npz
+/PCE_NARX/*.npz

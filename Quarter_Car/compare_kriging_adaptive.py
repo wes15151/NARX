@@ -26,13 +26,14 @@ CANDIDATE_POOL_SIZE = 10000
 N_PREDICT = 100000
 SEEDS = range(1, 11)
 BATCH_SIZE = 2000
-OUTPUT_DIR = Path(__file__).resolve().parent / "results" / "kriging_lhs100_lhs_random_lhs_adaptive"
+OUTPUT_DIR = Path(__file__).resolve().parent / "results" / "kriging_lhs100_lhs_random_lhs_adaptive_late"
 NORMAL_MEAN = np.array([2000.0, 2000.0, 20.0, 40.0, 600.0])
 NORMAL_STD = np.array([200.0, 200.0, 2.0, 4.0, 60.0])
 AMPLITUDE_BOUNDS = (0.09, 0.11)
 OMEGA_BOUNDS = (1.8 * np.pi, 2.2 * np.pi)
 PDF_EXPONENT = 0.5
 SENSITIVITY_UPDATE_INTERVAL = 10
+SENSITIVITY_START_TIME = 5.0
 
 
 def fit_one_trajectory(index, inputs, responses, time, terms):
@@ -60,7 +61,7 @@ def predict_coefficients(fitted, inputs):
 
 
 def recursive_sensitivity_weights(inputs, time, terms, coefficients, initial_history):
-    """Mean squared total derivatives dy(k)/da_j on representative trajectories."""
+    """Average squared total derivatives over times at or after the configured start."""
     n_terms = len(terms)
     n_inputs = len(inputs)
     lag = narx.MAX_LAG
@@ -82,23 +83,29 @@ def recursive_sensitivity_weights(inputs, time, terms, coefficients, initial_his
                     sensitivity[n] += derivative[:, None] * sensitivity[n - j]
     if not np.isfinite(prediction).all() or not np.isfinite(sensitivity).all():
         raise RuntimeError("Representative trajectories or recursive sensitivities diverged.")
+    selected_times = np.asarray(time)[lag:] >= SENSITIVITY_START_TIME
+    if not np.any(selected_times):
+        raise ValueError("Sensitivity start time leaves no prediction times to average.")
+    late_sensitivity = sensitivity[lag:][selected_times]
     # A common scaling preserves relative mean-square weights and prevents overflow.
-    scale = np.max(np.abs(sensitivity[lag:]))
+    scale = np.max(np.abs(late_sensitivity))
     if scale == 0.0:
         raise RuntimeError("All recursive sensitivities are zero.")
-    weights = np.mean((sensitivity[lag:] / scale) ** 2, axis=(0, 1))
+    weights = np.mean((late_sensitivity / scale) ** 2, axis=(0, 1))
     return weights / weights.max()
 
 
 @threadpool_limits.wrap(limits=1, user_api="blas")
-def acquisition_scores(fitted, candidate_inputs, sensitivity_weights):
+def acquisition_scores(fitted, candidate_inputs, sensitivity_weights,
+                       pdf_exponent=PDF_EXPONENT, variance_exponent=1.0, weight_exponent=1.0):
     """Joint PDF**0.5 times sensitivity-weighted coefficient posterior variances."""
     scores = np.zeros(len(candidate_inputs))
     for start in range(0, len(candidate_inputs), BATCH_SIZE):
         stop = min(start + BATCH_SIZE, len(candidate_inputs))
         scaled = (candidate_inputs[start:stop] - fitted["input_mean"]) / fitted["input_std"]
         for j, model in enumerate(fitted["models"]):
-            if sensitivity_weights[j] == 0.0:
+            weight = sensitivity_weights[j] ** weight_exponent
+            if weight == 0.0:
                 continue
             k_star = kriging.rbf_kernel(
                 fitted["scaled_inputs"], model["length_scale"],
@@ -109,7 +116,7 @@ def acquisition_scores(fitted, candidate_inputs, sensitivity_weights):
             tolerance = 1e-7 * model["signal_variance"]
             if np.any(variance < -tolerance):
                 raise RuntimeError("Negative GP posterior variance exceeds rounding tolerance.")
-            scores[start:stop] += sensitivity_weights[j] * np.maximum(variance, 0.0)
+            scores[start:stop] += weight * np.maximum(variance, 0.0) ** variance_exponent
     if not np.isfinite(scores).all():
         raise RuntimeError("Acquisition scores contain nonfinite values.")
 
@@ -128,7 +135,9 @@ def acquisition_scores(fitted, candidate_inputs, sensitivity_weights):
     log_joint_pdf[~in_uniform_support] = -np.inf
 
     # Subtracting the maximum preserves candidate ranking and avoids underflow.
-    pdf_weight = np.exp(PDF_EXPONENT * (log_joint_pdf - np.max(log_joint_pdf)))
+    pdf_weight = np.zeros(len(log_joint_pdf))
+    pdf_weight[in_uniform_support] = np.exp(
+        pdf_exponent * (log_joint_pdf[in_uniform_support] - np.max(log_joint_pdf)))
     weighted_scores = scores * pdf_weight
     if not np.isfinite(weighted_scores).all() or np.max(weighted_scores) <= 0.0:
         raise RuntimeError("PDF-weighted acquisition scores are invalid.")
@@ -292,6 +301,7 @@ def run_seed(initial_seed, inputs, responses, time, initial_state):
                  pdf_weights=np.array(selected_pdf_weights),
                  pdf_exponent=PDF_EXPONENT,
                  sensitivity_update_interval=SENSITIVITY_UPDATE_INTERVAL,
+                 sensitivity_start_time=SENSITIVITY_START_TIME,
                  sensitivity_update_sizes=np.array(weight_update_sizes),
                  sensitivity_weights=np.array(weight_updates),
                  acquisition_weights=np.array(acquisition_weights),
